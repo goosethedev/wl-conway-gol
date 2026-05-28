@@ -1,5 +1,7 @@
 use std::{os::fd::AsFd, time::Duration};
 
+use wl_conway::GameOfLife;
+
 use calloop::timer::{TimeoutAction, Timer};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
@@ -32,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timer = Timer::from_duration(Duration::from_millis(TICK_MILLIS));
     event_loop.handle().insert_source(timer, |_, _, app| {
         // On every tick, advance the game one step and trigger an update
-        app.game_step();
+        app.game.step();
         app.needs_update = true;
 
         // Reset the timer
@@ -69,7 +71,7 @@ struct AppState {
     height: usize,
 
     // Game state
-    grid: Vec<bool>,
+    game: GameOfLife,
 
     // Dynamic globals
     wl_shm: wl_shm::WlShm,
@@ -99,14 +101,14 @@ impl AppState {
 
         // Setup rest of state
         let (width, height) = (600, 600);
-        let mut grid = vec![false; (width / CELL_SIZE * height / CELL_SIZE) as usize];
+        let mut game = GameOfLife::new(width / CELL_SIZE, height / CELL_SIZE);
 
         // Initial grid state (glider pattern)
-        grid[0] = true;
-        grid[51] = true;
-        grid[52] = true;
-        grid[100] = true;
-        grid[101] = true;
+        game.grid[0] = true;
+        game.grid[51] = true;
+        game.grid[52] = true;
+        game.grid[100] = true;
+        game.grid[101] = true;
 
         Ok(AppState {
             quit: false,
@@ -115,44 +117,10 @@ impl AppState {
             needs_update: false,
             width,
             height,
-            grid,
+            game,
             wl_shm,
             wl_surface,
         })
-    }
-
-    fn game_step(&mut self) {
-        let grid_w = self.width as usize / CELL_SIZE;
-        let grid_h = self.height as usize / CELL_SIZE;
-        let mut next = self.grid.clone();
-
-        for y in 0..grid_h {
-            for x in 0..grid_w {
-                let mut alive_neighbors = 0;
-
-                for dy in [-1isize, 0, 1] {
-                    for dx in [-1isize, 0, 1] {
-                        let (i, j) = (x as isize + dx, y as isize + dy);
-                        if (dx == 0 && dy == 0)
-                            || (j < 0 || j >= grid_h as isize)
-                            || (i < 0 || i >= grid_w as isize)
-                        {
-                            continue;
-                        }
-                        if self.grid[i as usize + j as usize * grid_w] {
-                            alive_neighbors += 1;
-                        }
-                    }
-                }
-
-                next[x + y * grid_w] = match next[x + y * grid_w] {
-                    true => (2..=3).contains(&alive_neighbors),
-                    false => alive_neighbors == 3,
-                }
-            }
-        }
-
-        self.grid = next;
     }
 
     // FIX: This is extremely inefficient.
@@ -161,10 +129,9 @@ impl AppState {
     // handled with double/triple mem-mapped or GPU buffers.
     fn render_grid(&mut self, qh: &QueueHandle<Self>) {
         use std::io::Write;
-        let grid_w = self.width / CELL_SIZE;
-        let grid_h = self.height / CELL_SIZE;
-        let size = grid_w * grid_h * CELL_SIZE * 4;
         let (width, height) = (self.width as i32, self.height as i32);
+        let (grid_w, grid_h) = (self.game.cells_w, self.game.cells_h);
+        let size = grid_w * grid_h * CELL_SIZE * 4;
 
         // Buffered writing to a temp file
         let mut buf_file = tempfile::tempfile().unwrap();
@@ -174,7 +141,7 @@ impl AppState {
             for x in 0..self.height {
                 let cell_x = x / CELL_SIZE;
                 let cell_y = y / CELL_SIZE;
-                let bytes = match self.grid[cell_x + cell_y * grid_w] {
+                let bytes = match self.game.grid[cell_x + cell_y * grid_w] {
                     // Little-endian so B,G,R,X (no alpha)
                     true => [0xFF, 0xFF, 0xFF, 0xFF],  // white
                     false => [0x00, 0x00, 0x00, 0xFF], // black

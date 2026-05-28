@@ -630,7 +630,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wl-conway-gol"
+name = "wl-conway"
 version = "0.1.0"
 dependencies = [
  "calloop",
