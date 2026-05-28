@@ -1,0 +1,11 @@
+[package]
+name = "wl-conway-gol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calloop = "0.14.4"
+calloop-wayland-source = "0.4.1"
+tempfile = "3.27.0"
+wayland-client = "0.31.14"
+wayland-protocols = { version="0.32.12", features=["client"] }
