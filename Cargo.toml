@@ -7,5 +7,5 @@ edition = "2024"
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"
 tempfile = "3.27.0"
-wayland-client = "0.31.14"
-wayland-protocols = { version="0.32.12", features=["client"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version="0.32.13", features=["client"] }
