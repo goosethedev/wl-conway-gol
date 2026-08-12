@@ -1,6 +1,8 @@
+mod gol;
+
 use std::{os::fd::AsFd, time::Duration};
 
-use wl_conway::GameOfLife;
+use crate::gol::GameOfLife;
 
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
@@ -15,7 +17,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 const CELL_SIZE: usize = 12;
 const TICK_MILLIS: u64 = 100;
-const BUFFER_COUNT: usize = 2; // change to 3 if lagging
+const BUFFER_COUNT: usize = 3; // 2 may be enough though
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the Wayland server UNIX socket
