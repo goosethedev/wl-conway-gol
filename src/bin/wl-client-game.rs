@@ -13,6 +13,10 @@ use wayland_client::{
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
+const CELL_SIZE: usize = 12;
+const TICK_MILLIS: u64 = 100;
+const BUFFER_COUNT: usize = 2; // change to 3 if lagging
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the Wayland server UNIX socket
     let conn = Connection::connect_to_env()?;
@@ -56,10 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-const CELL_SIZE: usize = 12;
-const TICK_MILLIS: u64 = 1000;
-const BUFFER_COUNT: usize = 2; // change to 3 if lagging
 
 #[derive(Debug)]
 struct PoolBuffer {
@@ -146,11 +146,17 @@ impl AppState {
         let mut game = GameOfLife::new(width / CELL_SIZE, height / CELL_SIZE);
 
         // Initial grid state (glider pattern)
-        game.grid[0] = true;
-        game.grid[51] = true;
-        game.grid[52] = true;
-        game.grid[100] = true;
-        game.grid[101] = true;
+        game.flip(0, 30);
+        game.flip(1, 31);
+        game.flip(2, 31);
+        game.flip(0, 32);
+        game.flip(1, 32);
+
+        game.flip(0, 40);
+        game.flip(1, 41);
+        game.flip(2, 41);
+        game.flip(0, 42);
+        game.flip(1, 42);
 
         Ok(AppState {
             quit: false,
@@ -178,7 +184,7 @@ impl AppState {
         };
 
         let (width, height) = (self.width, self.height);
-        let grid_w = self.game.cells_w;
+        let grid_w = self.game.get_width();
         let stride = self.stride;
 
         let offset = idx * self.buf_size;
@@ -192,7 +198,7 @@ impl AppState {
             let cell_y = y / CELL_SIZE;
             let row = &mut buffer[y * stride..(y + 1) * stride];
             for cell_x in 0..grid_w {
-                let color = match self.game.grid[cell_y * grid_w + cell_x] {
+                let color = match self.game.at(cell_x, cell_y).unwrap().is_alive() {
                     true => WHITE,
                     false => BLACK,
                 };
