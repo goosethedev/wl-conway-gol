@@ -59,7 +59,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 const CELL_SIZE: usize = 12;
 const TICK_MILLIS: u64 = 1000;
+const BUFFER_COUNT: usize = 2; // change to 3 if lagging
 
+#[derive(Debug)]
+struct PoolBuffer {
+    wl_buffer: wl_buffer::WlBuffer,
+    busy: bool,
+}
+
+#[allow(dead_code)]
 #[derive(Debug)]
 struct AppState {
     // Window state
@@ -76,6 +84,13 @@ struct AppState {
     // Dynamic globals
     wl_shm: wl_shm::WlShm,
     wl_surface: wl_surface::WlSurface,
+
+    // Buffer pool
+    mmap: memmap2::MmapMut,
+    pool: wl_shm_pool::WlShmPool,
+    buffers: Vec<PoolBuffer>,
+    stride: usize,
+    buf_size: usize,
 }
 
 impl AppState {
@@ -99,7 +114,34 @@ impl AppState {
         // Submit all created objects
         wl_surface.commit();
 
-        // Setup rest of state
+        // Create buffer pool
+        let (width, height) = (600, 600);
+        let stride = width * 4; // size of each pixel: XRGB = 4 bytes
+        let buf_size = stride * height;
+        let total_size = buf_size * BUFFER_COUNT;
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(total_size as u64).unwrap();
+        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+        let pool = wl_shm.create_pool(file.as_fd(), total_size as i32, qh, ());
+
+        // Create buffers from pool
+        let buffers = (0..BUFFER_COUNT)
+            .map(|i| {
+                let wl_buffer = pool.create_buffer(
+                    (i * buf_size) as i32,
+                    width as i32,
+                    height as i32,
+                    stride as i32,
+                    wl_shm::Format::Xrgb8888,
+                    qh,
+                    i, // data: buffer index on pool for tracking
+                );
+                PoolBuffer { wl_buffer, busy: false }
+            })
+            .collect();
+
+        // Setup GoL state
         let (width, height) = (600, 600);
         let mut game = GameOfLife::new(width / CELL_SIZE, height / CELL_SIZE);
 
@@ -120,48 +162,52 @@ impl AppState {
             game,
             wl_shm,
             wl_surface,
+            mmap,
+            pool,
+            buffers,
+            stride,
+            buf_size,
         })
     }
 
-    // FIX: This is extremely inefficient.
-    // We're currently creating and destroying a temp file, a SHM pool and a buffer
-    // on every re-render. It's ok since the app only renders 1 FPS but this should be
-    // handled with double/triple mem-mapped or GPU buffers.
-    fn render_grid(&mut self, qh: &QueueHandle<Self>) {
-        use std::io::Write;
-        let (width, height) = (self.width as i32, self.height as i32);
-        let (grid_w, grid_h) = (self.game.cells_w, self.game.cells_h);
-        let size = grid_w * grid_h * CELL_SIZE * 4;
+    // Render the grid in an available buffer
+    fn render_grid(&mut self) {
+        let Some(idx) = self.buffers.iter().position(|b| !b.busy) else {
+            // No buffer released by the compositor, skip frame
+            return;
+        };
 
-        // Buffered writing to a temp file
-        let mut buf_file = tempfile::tempfile().unwrap();
-        let mut buf = std::io::BufWriter::with_capacity(size, &mut buf_file);
+        let (width, height) = (self.width, self.height);
+        let grid_w = self.game.cells_w;
+        let stride = self.stride;
 
-        for y in 0..self.width {
-            for x in 0..self.height {
-                let cell_x = x / CELL_SIZE;
-                let cell_y = y / CELL_SIZE;
-                let bytes = match self.game.grid[cell_x + cell_y * grid_w] {
-                    // Little-endian so B,G,R,X (no alpha)
-                    true => [0xFF, 0xFF, 0xFF, 0xFF],  // white
-                    false => [0x00, 0x00, 0x00, 0xFF], // black
+        let offset = idx * self.buf_size;
+        let buffer = &mut self.mmap[offset..offset + self.buf_size];
+
+        // Little-endian so B,G,R,X (no alpha)
+        const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+        const BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
+
+        for y in 0..height {
+            let cell_y = y / CELL_SIZE;
+            let row = &mut buffer[y * stride..(y + 1) * stride];
+            for cell_x in 0..grid_w {
+                let color = match self.game.grid[cell_y * grid_w + cell_x] {
+                    true => WHITE,
+                    false => BLACK,
                 };
-                buf.write_all(&bytes).unwrap();
+                for i in 0..CELL_SIZE {
+                    let x0 = (cell_x * CELL_SIZE + i) * 4;
+                    row[x0..x0 + 4].copy_from_slice(&color);
+                }
             }
         }
 
-        drop(buf);
-
-        // Create the SHM pool and a buffer from it
-        let format = wl_shm::Format::Xrgb8888;
-        let pool = self.wl_shm.create_pool(buf_file.as_fd(), width * height * 4, qh, ());
-        let wl_buffer = pool.create_buffer(0, width, height, width * 4, format, qh, ());
-
         // Attach the buffer and trigger a re-render
-        self.wl_surface.attach(Some(&wl_buffer), 0, 0);
-        self.wl_surface.damage_buffer(0, 0, width, height);
+        self.buffers[idx].busy = true;
+        self.wl_surface.attach(Some(&self.buffers[idx].wl_buffer), 0, 0);
+        self.wl_surface.damage_buffer(0, 0, width as i32, height as i32);
         self.wl_surface.commit();
-        pool.destroy();
     }
 
     /// Request a new frame to the wl_surface. The compositor will send a wl_callback.
@@ -212,13 +258,13 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
         event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
-        qh: &QueueHandle<AppState>,
+        _qh: &QueueHandle<AppState>,
     ) {
         // Handle the end of XdgToplevel Configure sequences, rendering the game
         if let xdg_surface::Event::Configure { serial } = event {
             proxy.ack_configure(serial);
             state.configured = true;
-            state.render_grid(qh);
+            state.render_grid();
         };
     }
 }
@@ -248,14 +294,30 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppState {
         event: <wl_callback::WlCallback as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
-        qh: &QueueHandle<AppState>,
+        _qh: &QueueHandle<AppState>,
     ) {
         // The compositor signalled it's ok to send a new frame (response to wl_surface.frame)
         // so we render a new one
         if let wl_callback::Event::Done { .. } = event {
             state.frame_pending = false;
-            state.render_grid(qh);
+            state.render_grid();
             state.needs_update = false;
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, usize> for AppState {
+    fn event(
+        state: &mut AppState,
+        _proxy: &wl_buffer::WlBuffer,
+        event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event,
+        data: &usize,
+        _conn: &Connection,
+        _qh: &QueueHandle<AppState>,
+    ) {
+        // Listen when the compositor releases a buffer from the pool
+        if let wl_buffer::Event::Release = event {
+            state.buffers[*data].busy = false;
         }
     }
 }
@@ -265,4 +327,3 @@ delegate_noop!(AppState: ignore wl_compositor::WlCompositor);
 delegate_noop!(AppState: ignore wl_surface::WlSurface);
 delegate_noop!(AppState: ignore wl_shm::WlShm);
 delegate_noop!(AppState: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(AppState: ignore wl_buffer::WlBuffer);

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"
+memmap2 = "0.9"
 tempfile = "3.27.0"
 wayland-client = "0.31.15"
 wayland-protocols = { version="0.32.13", features=["client"] }
