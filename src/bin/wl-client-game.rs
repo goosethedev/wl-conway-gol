@@ -5,7 +5,7 @@ use wl_conway::GameOfLife;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::{BindError, GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
@@ -226,7 +226,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppState {
     fn event(
         _state: &mut AppState,
         _registry: &wl_registry::WlRegistry,
-        _event: <wl_registry::WlRegistry as wayland_client::Proxy>::Event,
+        _event: <wl_registry::WlRegistry as Proxy>::Event,
         _data: &GlobalListContents,
         _conn: &Connection,
         _qhandle: &QueueHandle<AppState>,
@@ -239,7 +239,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
     fn event(
         _state: &mut AppState,
         proxy: &xdg_wm_base::XdgWmBase,
-        event: <xdg_wm_base::XdgWmBase as wayland_client::Proxy>::Event,
+        event: <xdg_wm_base::XdgWmBase as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<AppState>,
@@ -255,7 +255,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
     fn event(
         state: &mut AppState,
         proxy: &xdg_surface::XdgSurface,
-        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event,
+        event: <xdg_surface::XdgSurface as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<AppState>,
@@ -273,7 +273,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
     fn event(
         state: &mut AppState,
         _proxy: &xdg_toplevel::XdgToplevel,
-        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event,
+        event: <xdg_toplevel::XdgToplevel as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<AppState>,
@@ -291,7 +291,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for AppState {
     fn event(
         state: &mut AppState,
         _proxy: &wl_callback::WlCallback,
-        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event,
+        event: <wl_callback::WlCallback as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<AppState>,
@@ -310,7 +310,7 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for AppState {
     fn event(
         state: &mut AppState,
         _proxy: &wl_buffer::WlBuffer,
-        event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event,
+        event: <wl_buffer::WlBuffer as Proxy>::Event,
         data: &usize,
         _conn: &Connection,
         _qh: &QueueHandle<AppState>,
