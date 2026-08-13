@@ -1,23 +1,28 @@
 mod gol;
 
-use std::{os::fd::AsFd, time::Duration};
+use std::os::fd::AsFd;
+use std::time::Duration;
 
 use crate::gol::GameOfLife;
 
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
     globals::{BindError, GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
+        wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use xkbcommon::xkb;
 
 const CELL_SIZE: usize = 12;
-const TICK_MILLIS: u64 = 100;
-const BUFFER_COUNT: usize = 3; // 2 may be enough though
+const BUFFER_COUNT: usize = 3; // 2 may be enough
+const TICK_MILLIS_MIN: u64 = 100;
+const TICK_MILLIS_DEFAULT: u64 = 400;
+const TICK_MILLIS_MAX: u64 = 1000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the Wayland server UNIX socket
@@ -37,14 +42,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
 
     // Setup timer source for updating the UI periodically
-    let timer = Timer::from_duration(Duration::from_millis(TICK_MILLIS));
+    let timer = Timer::from_duration(Duration::from_millis(app.tick_millis));
     event_loop.handle().insert_source(timer, |_, _, app| {
         // On every tick, advance the game one step and trigger an update
-        app.game.step();
-        app.needs_update = true;
+        if !app.paused {
+            app.game.step();
+            app.needs_update = true;
+        }
 
         // Reset the timer
-        TimeoutAction::ToDuration(Duration::from_millis(TICK_MILLIS))
+        TimeoutAction::ToDuration(Duration::from_millis(app.tick_millis))
     })?;
 
     // Start the event loop with the two sources
@@ -63,14 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct PoolBuffer {
-    wl_buffer: wl_buffer::WlBuffer,
-    busy: bool,
-}
-
 #[allow(dead_code)]
-#[derive(Debug)]
 struct AppState {
     // Window state
     quit: bool,
@@ -82,17 +82,40 @@ struct AppState {
 
     // Game state
     game: GameOfLife,
+    paused: bool,
+    tick_millis: u64,
 
     // Dynamic globals
-    wl_shm: wl_shm::WlShm,
+    wl_shm: wl_shm::WlShm, // useful to create new shm_pools if needed
     wl_surface: wl_surface::WlSurface,
+    wl_keyboard: Option<wl_keyboard::WlKeyboard>,
+    wl_pointer: Option<wl_pointer::WlPointer>,
 
     // Buffer pool
     mmap: memmap2::MmapMut,
-    pool: wl_shm_pool::WlShmPool,
+    pool: wl_shm_pool::WlShmPool, // useful to create or resize buffers if needed
     buffers: Vec<PoolBuffer>,
     stride: usize,
     buf_size: usize,
+
+    // Keyboard handling
+    xkb_context: xkb::Context,
+    xkb_state: Option<xkb::State>,
+
+    // Pointer handling
+    pointer_pos: (f64, f64),
+    pointer_frame: PointerFrame, // to accum events until Frame
+}
+
+struct PoolBuffer {
+    wl_buffer: wl_buffer::WlBuffer,
+    busy: bool,
+}
+
+#[derive(Default)]
+struct PointerFrame {
+    motion: Option<(f64, f64)>,
+    button: Option<(u32, bool)>, // button code, pressed
 }
 
 impl AppState {
@@ -143,22 +166,25 @@ impl AppState {
             })
             .collect();
 
+        // Get the seat global
+        let _wl_seat: wl_seat::WlSeat = globals.bind(qh, 1..=9, ())?;
+
         // Setup GoL state
         let (width, height) = (600, 600);
         let mut game = GameOfLife::new(width / CELL_SIZE, height / CELL_SIZE);
 
         // Initial grid state (glider pattern)
-        game.flip(0, 30);
-        game.flip(1, 31);
-        game.flip(2, 31);
-        game.flip(0, 32);
-        game.flip(1, 32);
+        game.set_alive(0, 30);
+        game.set_alive(1, 31);
+        game.set_alive(2, 31);
+        game.set_alive(0, 32);
+        game.set_alive(1, 32);
 
-        game.flip(0, 40);
-        game.flip(1, 41);
-        game.flip(2, 41);
-        game.flip(0, 42);
-        game.flip(1, 42);
+        game.set_alive(0, 40);
+        game.set_alive(1, 41);
+        game.set_alive(2, 41);
+        game.set_alive(0, 42);
+        game.set_alive(1, 42);
 
         Ok(AppState {
             quit: false,
@@ -168,13 +194,21 @@ impl AppState {
             width,
             height,
             game,
+            paused: false,
+            tick_millis: TICK_MILLIS_DEFAULT,
             wl_shm,
             wl_surface,
+            wl_keyboard: None,
+            wl_pointer: None,
             mmap,
             pool,
             buffers,
             stride,
             buf_size,
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+            pointer_pos: (0., 0.),
+            pointer_frame: PointerFrame::default(),
         })
     }
 
@@ -227,6 +261,29 @@ impl AppState {
         self.wl_surface.frame(qh, ());
         self.wl_surface.commit();
         self.frame_pending = true;
+    }
+
+    /// Handle a key pressed to perform an action
+    fn handle_key(&mut self, key: xkb::Keysym) {
+        use xkb::Keysym;
+        match key {
+            Keysym::space => self.paused = !self.paused,
+            Keysym::plus | Keysym::Up => {
+                self.tick_millis = TICK_MILLIS_MIN.max(self.tick_millis - 100)
+            }
+            Keysym::minus | Keysym::Down => {
+                self.tick_millis = TICK_MILLIS_MAX.min(self.tick_millis + 100)
+            }
+            Keysym::r => {
+                let cell_x = self.pointer_pos.0 as usize / CELL_SIZE;
+                let cell_y = self.pointer_pos.1 as usize / CELL_SIZE;
+                self.game.spawn_random_glider(cell_x, cell_y);
+            }
+            Keysym::c => self.game.clear(),
+            Keysym::q => self.quit = true,
+            _ => return,
+        }
+        self.needs_update = true;
     }
 }
 
@@ -326,6 +383,125 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for AppState {
         // Listen when the compositor releases a buffer from the pool
         if let wl_buffer::Event::Release = event {
             state.buffers[*data].busy = false;
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for AppState {
+    fn event(
+        state: &mut AppState,
+        seat: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<AppState>,
+    ) {
+        // Listen to seat capabilities to know if keyboard and pointer are supported
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let WEnum::Value(caps) = capabilities else { return };
+            if caps.contains(wl_seat::Capability::Keyboard) && state.wl_keyboard.is_none() {
+                state.wl_keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+            if caps.contains(wl_seat::Capability::Pointer) && state.wl_pointer.is_none() {
+                state.wl_pointer = Some(seat.get_pointer(qh, ()));
+            }
+            // TODO: handle keyboard and pointer disconnections
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: <wl_keyboard::WlKeyboard as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // TODO: handle repeat events
+        // Handle key presses
+        use wl_keyboard::Event;
+        match event {
+            Event::Keymap { format, fd, size } => {
+                if format == WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) {
+                    let keymap = unsafe {
+                        xkb::Keymap::new_from_fd(
+                            &state.xkb_context,
+                            fd,
+                            size as usize,
+                            xkb::KEYMAP_FORMAT_TEXT_V1,
+                            xkb::COMPILE_NO_FLAGS,
+                        )
+                    }
+                    .ok()
+                    .flatten();
+                    state.xkb_state = keymap.map(|km| xkb::State::new(&km));
+                }
+            }
+            Event::Key { key, state: key_state, .. } => {
+                let Some(xkb_state) = &state.xkb_state else { return };
+                let keysym = xkb_state.key_get_one_sym((key + 8).into());
+
+                // Check is its a key press
+                if key_state == WEnum::Value(wl_keyboard::KeyState::Pressed) {
+                    state.handle_key(keysym);
+                }
+            }
+            Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
+                if let Some(xkb_state) = &mut state.xkb_state {
+                    xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: <wl_pointer::WlPointer as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Handle mouse events
+        match event {
+            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                state.pointer_frame.motion = Some((surface_x, surface_y));
+            }
+            wl_pointer::Event::Button { button, state: btn_state, .. } => {
+                let pressed = btn_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
+                state.pointer_frame.button = Some((button, pressed));
+            }
+            wl_pointer::Event::Frame => {
+                let frame = std::mem::take(&mut state.pointer_frame);
+                if let Some(xy) = frame.motion {
+                    state.pointer_pos = xy;
+                }
+                if let Some((button, pressed)) = frame.button
+                    && pressed
+                {
+                    // From Linux kernel codes at input-event-codes.h
+                    const BTN_LEFT: u32 = 0x110;
+                    const BTN_RIGHT: u32 = 0x111;
+
+                    let cell_x = state.pointer_pos.0 as usize / CELL_SIZE;
+                    let cell_y = state.pointer_pos.1 as usize / CELL_SIZE;
+
+                    // Left button: set cell alive
+                    if button == BTN_LEFT {
+                        state.game.set_alive(cell_x, cell_y);
+                    } else if button == BTN_RIGHT {
+                        state.game.set_dead(cell_x, cell_y);
+                    }
+
+                    state.needs_update = true;
+                }
+            }
+            _ => {}
         }
     }
 }

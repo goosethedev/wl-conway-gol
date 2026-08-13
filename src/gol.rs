@@ -18,12 +18,6 @@ impl Cell {
     }
 }
 
-impl From<bool> for Cell {
-    fn from(value: bool) -> Self {
-        if value { Cell::Alive } else { Cell::Dead }
-    }
-}
-
 impl GameOfLife {
     pub fn new(width: usize, height: usize) -> Self {
         let grid = vec![Cell::Dead; width * height];
@@ -35,14 +29,21 @@ impl GameOfLife {
         self.grid.iter().nth(y * self.height + x).copied()
     }
 
-    pub fn flip(&mut self, x: usize, y: usize) {
-        if let Some(pos) = self.grid.iter_mut().nth(y * self.height + x) {
-            *pos = if pos.is_alive() { Cell::Dead } else { Cell::Alive };
-        }
+    pub fn set_alive(&mut self, x: usize, y: usize) {
+        self.grid.iter_mut().nth(y * self.height + x).map(|p| *p = Cell::Alive);
+    }
+
+    pub fn set_dead(&mut self, x: usize, y: usize) {
+        self.grid.iter_mut().nth(y * self.height + x).map(|p| *p = Cell::Dead);
     }
 
     pub fn get_width(&self) -> usize {
         self.width
+    }
+
+    pub fn clear(&mut self) {
+        self.grid.fill(Cell::Dead);
+        self.last.fill(Cell::Dead);
     }
 
     pub fn step(&mut self) {
@@ -72,12 +73,55 @@ impl GameOfLife {
                 }
 
                 let idx = (x + y * cells_w) as usize;
-                self.grid[idx] = match self.last[idx] {
+                let condition = match self.last[idx] {
                     Cell::Alive => (2..=3).contains(&alive_neighbors),
                     Cell::Dead => alive_neighbors == 3,
-                }
-                .into()
+                };
+
+                self.grid[idx] = if condition { Cell::Alive } else { Cell::Dead };
             }
+        }
+    }
+
+    pub fn spawn_random_glider(&mut self, x: usize, y: usize) {
+        let rand = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        match rand % 4 {
+            // Glider SW
+            0 => {
+                self.set_alive(x + 0, y + 0);
+                self.set_alive(x + 1, y + 1);
+                self.set_alive(x + 2, y + 1);
+                self.set_alive(x + 0, y + 2);
+                self.set_alive(x + 1, y + 2);
+            }
+            // Glider SE
+            1 => {
+                self.set_alive(x + 2, y + 0);
+                self.set_alive(x + 1, y + 1);
+                self.set_alive(x + 1, y + 2);
+                self.set_alive(x + 0, y + 0);
+                self.set_alive(x + 0, y + 1);
+            }
+            // Glider NE
+            2 => {
+                self.set_alive(x + 0, y + 1);
+                self.set_alive(x + 1, y + 0);
+                self.set_alive(x + 1, y + 1);
+                self.set_alive(x + 2, y + 0);
+                self.set_alive(x + 2, y + 2);
+            }
+            // Glider NW
+            3 => {
+                self.set_alive(x + 0, y + 2);
+                self.set_alive(x + 1, y + 0);
+                self.set_alive(x + 1, y + 1);
+                self.set_alive(x + 2, y + 1);
+                self.set_alive(x + 2, y + 2);
+            }
+            _ => {}
         }
     }
 }
