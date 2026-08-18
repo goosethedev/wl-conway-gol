@@ -26,15 +26,23 @@ impl GameOfLife {
     }
 
     pub fn at(&self, x: usize, y: usize) -> Option<Cell> {
-        self.grid.iter().nth(y * self.height + x).copied()
+        self.grid.get(y * self.width + x).copied()
     }
 
     pub fn set_alive(&mut self, x: usize, y: usize) {
-        self.grid.iter_mut().nth(y * self.height + x).map(|p| *p = Cell::Alive);
+        self.set(x, y, Cell::Alive);
     }
 
     pub fn set_dead(&mut self, x: usize, y: usize) {
-        self.grid.iter_mut().nth(y * self.height + x).map(|p| *p = Cell::Dead);
+        self.set(x, y, Cell::Dead);
+    }
+
+    fn set(&mut self, x: usize, y: usize, val: Cell) {
+        if let Some(p) = self.grid.get_mut(y * self.width + x) {
+            *p = val;
+        } else {
+            eprintln!("Invalid set op at {x}x{y} on grid {}x{}", self.width, self.height);
+        }
     }
 
     pub fn get_width(&self) -> usize {
@@ -43,7 +51,6 @@ impl GameOfLife {
 
     pub fn clear(&mut self) {
         self.grid.fill(Cell::Dead);
-        self.last.fill(Cell::Dead);
     }
 
     pub fn step(&mut self) {
@@ -83,6 +90,30 @@ impl GameOfLife {
         }
     }
 
+    pub fn resize(&mut self, new_width: usize, new_height: usize) {
+        if new_width == self.width && new_height == self.height {
+            return;
+        };
+
+        // Swap and resize 'grid' to recalculate from 'last'
+        std::mem::swap(&mut self.grid, &mut self.last);
+        self.grid.fill(Cell::Dead);
+        self.grid.resize(new_width * new_height, Cell::Dead);
+
+        let (cells_w, cells_h) = (self.width.min(new_width), self.height.min(new_height));
+
+        for y in 0..cells_h {
+            for x in 0..cells_w {
+                self.grid[y * new_width + x] = self.last[y * self.width + x];
+            }
+        }
+
+        self.width = new_width;
+        self.height = new_height;
+        self.last.resize(new_width * new_height, Cell::Dead);
+    }
+
+    #[allow(clippy::identity_op)]
     pub fn spawn_random_glider(&mut self, x: usize, y: usize) {
         let rand = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

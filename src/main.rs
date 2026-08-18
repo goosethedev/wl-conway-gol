@@ -23,6 +23,8 @@ const BUFFER_COUNT: usize = 3; // 2 may be enough
 const TICK_MILLIS_MIN: u64 = 100;
 const TICK_MILLIS_DEFAULT: u64 = 400;
 const TICK_MILLIS_MAX: u64 = 1000;
+const DEFAULT_WINDOW_WIDTH: usize = 600;
+const DEFAULT_WINDOW_HEIGHT: usize = 600;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the Wayland server UNIX socket
@@ -70,15 +72,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[allow(dead_code)]
 struct AppState {
     // Window state
+    width: usize,
+    height: usize,
     quit: bool,
     configured: bool,
     frame_pending: bool,
     needs_update: bool,
-    width: usize,
-    height: usize,
+    pending_resize: (i32, i32),
 
     // Game state
     game: GameOfLife,
@@ -91,9 +93,9 @@ struct AppState {
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     wl_pointer: Option<wl_pointer::WlPointer>,
 
-    // Buffer pool
-    mmap: memmap2::MmapMut,
-    pool: wl_shm_pool::WlShmPool, // useful to create or resize buffers if needed
+    // Buffer pool (created lazily on xdg_surface configure)
+    pool: Option<wl_shm_pool::WlShmPool>,
+    mmap: Option<memmap2::MmapMut>,
     buffers: Vec<PoolBuffer>,
     stride: usize,
     buf_size: usize,
@@ -133,64 +135,26 @@ impl AppState {
         xdg_toplevel.set_app_id("game_of_life".to_string());
         xdg_toplevel.set_title("Conway's Game of Life".to_string());
 
-        // Get the SHM object for creating buffers on render
-        let wl_shm: wl_shm::WlShm = globals.bind(qh, 1..=2, ())?;
-
-        // Submit all created objects
+        // Submit the created xdg_toplevel
         wl_surface.commit();
 
-        // Create buffer pool
-        let (width, height) = (600, 600);
-        let stride = width * 4; // size of each pixel: XRGB = 4 bytes
-        let buf_size = stride * height;
-        let total_size = buf_size * BUFFER_COUNT;
-
-        let file = tempfile::tempfile().unwrap();
-        file.set_len(total_size as u64).unwrap();
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
-        let pool = wl_shm.create_pool(file.as_fd(), total_size as i32, qh, ());
-
-        // Create buffers from pool
-        let buffers = (0..BUFFER_COUNT)
-            .map(|i| {
-                let wl_buffer = pool.create_buffer(
-                    (i * buf_size) as i32,
-                    width as i32,
-                    height as i32,
-                    stride as i32,
-                    wl_shm::Format::Xrgb8888,
-                    qh,
-                    i, // data: buffer index on pool for tracking
-                );
-                PoolBuffer { wl_buffer, busy: false }
-            })
-            .collect();
+        // Get the SHM object for creating buffers on render
+        let wl_shm: wl_shm::WlShm = globals.bind(qh, 1..=2, ())?;
 
         // Get the seat global
         let _wl_seat: wl_seat::WlSeat = globals.bind(qh, 1..=9, ())?;
 
-        // Setup GoL state
-        let (width, height) = (600, 600);
+        // Setup GoL state with initial state (glider at the middle)
+        let (width, height) = (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
         let mut game = GameOfLife::new(width / CELL_SIZE, height / CELL_SIZE);
-
-        // Initial grid state (glider pattern)
-        game.set_alive(0, 30);
-        game.set_alive(1, 31);
-        game.set_alive(2, 31);
-        game.set_alive(0, 32);
-        game.set_alive(1, 32);
-
-        game.set_alive(0, 40);
-        game.set_alive(1, 41);
-        game.set_alive(2, 41);
-        game.set_alive(0, 42);
-        game.set_alive(1, 42);
+        game.spawn_random_glider(width / CELL_SIZE / 2, height / CELL_SIZE / 2);
 
         Ok(AppState {
             quit: false,
             configured: false,
             frame_pending: false,
             needs_update: false,
+            pending_resize: (width as i32, height as i32),
             width,
             height,
             game,
@@ -200,11 +164,11 @@ impl AppState {
             wl_surface,
             wl_keyboard: None,
             wl_pointer: None,
-            mmap,
-            pool,
-            buffers,
-            stride,
-            buf_size,
+            pool: None,
+            mmap: None,
+            buffers: vec![],
+            stride: 0,
+            buf_size: 0,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
             pointer_pos: (0., 0.),
@@ -214,23 +178,24 @@ impl AppState {
 
     // Render the grid in an available buffer
     fn render_grid(&mut self) {
-        let Some(idx) = self.buffers.iter().position(|b| !b.busy) else {
-            // No buffer released by the compositor, skip frame
-            return;
-        };
+        // No pool created yet
+        let Some(mmap) = self.mmap.as_mut() else { return };
+        // No buffer released by the compositor, skip frame
+        let Some(idx) = self.buffers.iter().position(|b| !b.busy) else { return };
 
         let (width, height) = (self.width, self.height);
         let grid_w = self.game.get_width();
         let stride = self.stride;
 
         let offset = idx * self.buf_size;
-        let buffer = &mut self.mmap[offset..offset + self.buf_size];
+        let buffer = &mut mmap[offset..offset + self.buf_size];
 
         // Little-endian so B,G,R,X (no alpha)
         const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
         const BLACK: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
 
-        for y in 0..height {
+        // Fit render height to exact cell multiple
+        for y in 0..(height - (height % CELL_SIZE)) {
             let cell_y = y / CELL_SIZE;
             let row = &mut buffer[y * stride..(y + 1) * stride];
             for cell_x in 0..grid_w {
@@ -238,9 +203,10 @@ impl AppState {
                     true => WHITE,
                     false => BLACK,
                 };
+                let x0 = cell_x * CELL_SIZE * 4;
                 for i in 0..CELL_SIZE {
-                    let x0 = (cell_x * CELL_SIZE + i) * 4;
-                    row[x0..x0 + 4].copy_from_slice(&color);
+                    let px = x0 + i * 4;
+                    row[px..px + 4].copy_from_slice(&color);
                 }
             }
         }
@@ -250,6 +216,62 @@ impl AppState {
         self.wl_surface.attach(Some(&self.buffers[idx].wl_buffer), 0, 0);
         self.wl_surface.damage_buffer(0, 0, width as i32, height as i32);
         self.wl_surface.commit();
+    }
+
+    // Resize the window and in turn, recreate the shm pool buffers
+    fn resize(&mut self, new_width: usize, new_height: usize, qh: &QueueHandle<Self>) {
+        if new_width == 0 || new_height == 0 {
+            return;
+        }
+
+        // Resize game
+        let new_cells_w = (new_width / CELL_SIZE).max(1);
+        let new_cells_h = (new_height / CELL_SIZE).max(1);
+        self.game.resize(new_cells_w, new_cells_h);
+
+        // Teardown old pool and buffers
+        if let Some(pool) = self.pool.take() {
+            pool.destroy();
+        }
+        for pb in self.buffers.drain(..) {
+            pb.wl_buffer.destroy();
+        }
+
+        // Create new pool
+        let stride = new_width * 4; // 4 bytes per pixel
+        let buf_size = stride * new_height;
+        let total_size = buf_size * BUFFER_COUNT;
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(total_size as u64).unwrap();
+        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+
+        let pool = self.wl_shm.create_pool(file.as_fd(), total_size as i32, qh, ());
+
+        // Create buffers
+        let buffers = (0..BUFFER_COUNT)
+            .map(|i| {
+                let wl_buffer = pool.create_buffer(
+                    (i * buf_size) as i32,
+                    new_width as i32,
+                    new_height as i32,
+                    stride as i32,
+                    wl_shm::Format::Xbgr8888,
+                    qh,
+                    i,
+                );
+                PoolBuffer { wl_buffer, busy: false }
+            })
+            .collect();
+
+        // Update state
+        self.width = new_width;
+        self.height = new_height;
+        self.pool = Some(pool);
+        self.mmap = Some(mmap);
+        self.buffers = buffers;
+        self.stride = stride;
+        self.buf_size = buf_size;
     }
 
     /// Request a new frame to the wl_surface. The compositor will send a wl_callback.
@@ -323,13 +345,21 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
         event: <xdg_surface::XdgSurface as Proxy>::Event,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<AppState>,
+        qh: &QueueHandle<AppState>,
     ) {
-        // Handle the end of XdgToplevel Configure sequences, rendering the game
+        // Check if there are pending resize changes to do
         if let xdg_surface::Event::Configure { serial } = event {
             proxy.ack_configure(serial);
+
+            let first_time = !state.configured;
             state.configured = true;
-            state.render_grid();
+
+            let new_w = state.pending_resize.0 as usize;
+            let new_h = state.pending_resize.1 as usize;
+            if first_time || new_w != state.width || new_h != state.height {
+                state.resize(new_w, new_h, qh);
+                state.render_grid();
+            }
         };
     }
 }
@@ -343,11 +373,15 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
         _conn: &Connection,
         _qh: &QueueHandle<AppState>,
     ) {
-        // TODO: Handle Configure events (resizes, fullscreen, etc)
         // Note: do NOT render here yet, only apply changes to internal state
         // Re-rendering should be performed at XdgSurface Configure event
-        if let xdg_toplevel::Event::Close = event {
-            state.quit = true;
+        match event {
+            xdg_toplevel::Event::Close => state.quit = true,
+            xdg_toplevel::Event::Configure { width, height, .. } if width > 0 && height > 0 => {
+                // If both are zero, preserve last dimensions and do nothing
+                state.pending_resize = (width, height);
+            }
+            _ => {}
         }
     }
 }
